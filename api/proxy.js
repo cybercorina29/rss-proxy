@@ -1,13 +1,48 @@
+const { lookup } = require('node:dns/promises');
+const { isIP } = require('node:net');
 const MAX_BYTES = 3 * 1024 * 1024;
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 
-function validate(raw) {
+function publicAddress(address) {
+  const ip = address.toLowerCase();
+  if (isIP(ip) === 4) {
+    const p = ip.split('.').map(Number);
+    return !(p[0] === 0 || p[0] === 10 || p[0] === 127 || p[0] >= 224 ||
+      (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||
+      (p[0] === 169 && p[1] === 254) || (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||
+      (p[0] === 192 && (p[1] === 168 || (p[1] === 0 && (p[2] === 0 || p[2] === 2)))) ||
+      (p[0] === 198 && (p[1] === 18 || p[1] === 19 || (p[1] === 51 && p[2] === 100))) ||
+      (p[0] === 203 && p[1] === 0 && p[2] === 113));
+  }
+  if (isIP(ip) === 6) {
+    if (ip.startsWith('::ffff:')) {
+      const embedded = ip.slice(7);
+      if (isIP(embedded) === 4) return publicAddress(embedded);
+      if (/^[0-9a-f]{1,4}:[0-9a-f]{1,4}$/.test(embedded)) {
+        const [a, b] = embedded.split(':').map(x => parseInt(x, 16));
+        return publicAddress([a >> 8, a & 255, b >> 8, b & 255].join('.'));
+      }
+    }
+    return !(ip === '::' || ip === '::1' || ip.startsWith('fc') ||
+      ip.startsWith('fd') || /^fe[89ab]/.test(ip) || ip.startsWith('2001:db8:'));
+  }
+  return false;
+}
+
+async function validate(raw) {
   const url = new URL(raw);
-  const hosts = (process.env.ALLOWED_RSS_HOSTS || 'news.google.com,feeds.bbci.co.uk,api.gdeltproject.org')
-    .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
   if (url.protocol !== 'https:' || url.username || url.password ||
-      (url.port && url.port !== '443') || !hosts.includes(url.hostname.toLowerCase())) {
-    throw new Error('Only HTTPS URLs on allowed RSS hosts are supported.');
+      (url.port && url.port !== '443')) {
+    throw new Error('Only standard HTTPS URLs without credentials are supported.');
+  }
+  const host = url.hostname.toLowerCase().replace(/\.$/, '');
+  if (!host.includes('.') || host === 'localhost' || host.endsWith('.localhost') ||
+      host.endsWith('.local') || host.endsWith('.internal')) {
+    throw new Error('Local and internal hosts are not supported.');
+  }
+  const addresses = isIP(host) ? [{ address: host }] : await lookup(host, { all: true });
+  if (!addresses.length || addresses.some(({ address }) => !publicAddress(address))) {
+    throw new Error('Only public internet hosts are supported.');
   }
   return url;
 }
@@ -27,7 +62,7 @@ module.exports = async function handler(req, res) {
   let target;
   try {
     if (!raw) throw new Error('Missing url query parameter.');
-    target = validate(raw);
+    target = await validate(raw);
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
@@ -48,7 +83,7 @@ module.exports = async function handler(req, res) {
       const location = upstream.headers.get('location');
       await upstream.body?.cancel();
       if (!location || hop === 3) throw new Error('Invalid or excessive upstream redirects.');
-      target = validate(new URL(location, target).href);
+      target = await validate(new URL(location, target).href);
     }
     const chunks = [];
     let size = 0;
